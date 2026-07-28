@@ -1694,10 +1694,12 @@ int PCBNEW_JOBS_HANDLER::JobPcbQuery( JOB* aJob )
 
         for( PCB_LAYER_ID layer : brd->GetEnabledLayers().Seq() )
         {
+            // "name" is what the user renamed the layer to; "canonical_name" is the stable
+            // identifier ("F.Cu") that a script should match on and that the board file stores.
             layers.push_back( { { "id", static_cast<int>( layer ) },
                                 { "name", TO_UTF8( brd->GetLayerName( layer ) ) },
                                 { "canonical_name", TO_UTF8( LSET::Name( layer ) ) },
-                                { "type", LayerName( layer ).ToStdString() } } );
+                                { "copper", IsCopperLayer( layer ) } } );
         }
 
         doc["layers"] = layers;
