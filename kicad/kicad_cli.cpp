@@ -54,6 +54,7 @@
 #include "cli/command_pcb.h"
 #include "cli/command_pcb_export.h"
 #include "cli/command_pcb_drc.h"
+#include "cli/command_pcb_query.h"
 #include "cli/command_pcb_render.h"
 #include "cli/command_pcb_export_3d.h"
 #include "cli/command_pcb_export_drill.h"
@@ -125,6 +126,7 @@ static CLI::JOBSET_COMMAND               jobsetCmd{};
 static CLI::JOBSET_RUN_COMMAND           jobsetRunCmd{};
 static CLI::PCB_COMMAND                  pcbCmd{};
 static CLI::PCB_DRC_COMMAND              pcbDrcCmd{};
+static CLI::PCB_QUERY_COMMAND            pcbQueryCmd{};
 static CLI::PCB_RENDER_COMMAND           pcbRenderCmd{};
 static CLI::PCB_UPGRADE_COMMAND          pcbUpgradeCmd{};
 static CLI::PCB_IMPORT_COMMAND           pcbImportCmd{};
@@ -205,6 +207,9 @@ static std::vector<COMMAND_ENTRY> commandStack = {
         {
             {
                 &pcbDrcCmd
+            },
+            {
+                &pcbQueryCmd
             },
             {
                 &pcbImportCmd

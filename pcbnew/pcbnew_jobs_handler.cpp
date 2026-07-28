@@ -57,7 +57,12 @@
 #include <jobs/job_pcb_render.h>
 #include <jobs/job_pcb_drc.h>
 #include <jobs/job_pcb_import.h>
+#include <jobs/job_pcb_query.h>
 #include <jobs/job_pcb_upgrade.h>
+#include <board.h>
+#include <base_units.h>
+#include <netinfo.h>
+#include <zone.h>
 #include <eda_units.h>
 #include <footprint_library_adapter.h>
 #include <lset.h>
@@ -347,6 +352,14 @@ PCBNEW_JOBS_HANDLER::PCBNEW_JOBS_HANDLER( KIWAY* aKiway ) :
 
                   DIALOG_DRC_JOB_CONFIG dlg( aParent, drcJob );
                   return dlg.ShowModal() == wxID_OK;
+              } );
+    Register( "pcb_query",
+              std::bind( &PCBNEW_JOBS_HANDLER::JobPcbQuery, this, std::placeholders::_1 ),
+              []( JOB* job, wxWindow* aParent ) -> bool
+              {
+                  // No settings dialog: this job exists for scripted callers and every knob it
+                  // has is reachable from the command line.
+                  return false;
               } );
     Register( "ipc2581",
               std::bind( &PCBNEW_JOBS_HANDLER::JobExportIpc2581, this, std::placeholders::_1 ),
@@ -1596,6 +1609,256 @@ int PCBNEW_JOBS_HANDLER::JobExportStats( JOB* aJob )
     m_reporter->Report( wxString::Format( _( "Wrote board statistics to '%s'.\n" ), outPath ), RPT_SEVERITY_ACTION );
 
     statsJob->AddOutput( outPath );
+
+    return CLI::EXIT_CODES::OK;
+}
+
+
+/**
+ * Convert an internal unit length into the units the caller asked for.
+ *
+ * Coordinates are emitted as plain numbers rather than unit-suffixed strings so a consumer can
+ * do arithmetic on them directly; the chosen unit is recorded once at the top of the document.
+ */
+static double queryLength( int aValue, JOB_PCB_QUERY::UNITS aUnits )
+{
+    double mm = pcbIUScale.IUTomm( aValue );
+
+    switch( aUnits )
+    {
+    case JOB_PCB_QUERY::UNITS::INCH: return mm / 25.4;
+    case JOB_PCB_QUERY::UNITS::MILS: return mm / 25.4 * 1000.0;
+    case JOB_PCB_QUERY::UNITS::MM:
+    default:                         return mm;
+    }
+}
+
+
+int PCBNEW_JOBS_HANDLER::JobPcbQuery( JOB* aJob )
+{
+    JOB_PCB_QUERY* queryJob = dynamic_cast<JOB_PCB_QUERY*>( aJob );
+
+    if( queryJob == nullptr )
+        return CLI::EXIT_CODES::ERR_UNKNOWN;
+
+    BOARD* brd = getBoard( queryJob->m_filename );
+
+    if( !brd )
+        return CLI::EXIT_CODES::ERR_INVALID_INPUT_FILE;
+
+    JOB_PCB_QUERY::UNITS units = queryJob->m_units;
+
+    auto lengthOf = [units]( int aValue ) -> double
+    {
+        return queryLength( aValue, units );
+    };
+
+    nlohmann::json doc;
+
+    switch( units )
+    {
+    case JOB_PCB_QUERY::UNITS::INCH: doc["units"] = "in"; break;
+    case JOB_PCB_QUERY::UNITS::MILS: doc["units"] = "mils"; break;
+    case JOB_PCB_QUERY::UNITS::MM:
+    default:                         doc["units"] = "mm"; break;
+    }
+
+    wxFileName boardFile = brd->GetFileName();
+
+    if( boardFile.GetName().IsEmpty() )
+        boardFile = wxFileName( queryJob->m_filename );
+
+    if( queryJob->m_includeBoard )
+    {
+        nlohmann::json board;
+
+        board["filename"] = TO_UTF8( boardFile.GetFullName() );
+
+        if( brd->GetProject() )
+            board["project"] = TO_UTF8( brd->GetProject()->GetProjectName() );
+
+        BOX2I bbox = brd->ComputeBoundingBox( true );
+
+        board["copper_layer_count"] = brd->GetCopperLayerCount();
+        board["bounding_box"] = { { "x", lengthOf( bbox.GetX() ) },
+                                  { "y", lengthOf( bbox.GetY() ) },
+                                  { "width", lengthOf( bbox.GetWidth() ) },
+                                  { "height", lengthOf( bbox.GetHeight() ) } };
+
+        doc["board"] = board;
+    }
+
+    if( queryJob->m_includeLayers )
+    {
+        nlohmann::json layers = nlohmann::json::array();
+
+        for( PCB_LAYER_ID layer : brd->GetEnabledLayers().Seq() )
+        {
+            layers.push_back( { { "id", static_cast<int>( layer ) },
+                                { "name", TO_UTF8( brd->GetLayerName( layer ) ) },
+                                { "canonical_name", TO_UTF8( LSET::Name( layer ) ) },
+                                { "type", LayerName( layer ).ToStdString() } } );
+        }
+
+        doc["layers"] = layers;
+    }
+
+    if( queryJob->m_includeFootprints )
+    {
+        nlohmann::json footprints = nlohmann::json::array();
+
+        for( FOOTPRINT* fp : brd->Footprints() )
+        {
+            nlohmann::json entry;
+
+            entry["reference"] = TO_UTF8( fp->GetReference() );
+            entry["value"] = TO_UTF8( fp->GetValue() );
+            entry["library_id"] = TO_UTF8( fp->GetFPID().Format().wx_str() );
+            entry["layer"] = TO_UTF8( brd->GetLayerName( fp->GetLayer() ) );
+            entry["position"] = { { "x", lengthOf( fp->GetPosition().x ) },
+                                  { "y", lengthOf( fp->GetPosition().y ) } };
+            entry["orientation_deg"] = fp->GetOrientation().AsDegrees();
+            entry["locked"] = fp->IsLocked();
+            entry["pad_count"] = static_cast<int>( fp->Pads().size() );
+
+            if( queryJob->m_includePads )
+            {
+                nlohmann::json pads = nlohmann::json::array();
+
+                for( PAD* pad : fp->Pads() )
+                {
+                    pads.push_back( { { "number", TO_UTF8( pad->GetNumber() ) },
+                                      { "net", TO_UTF8( pad->GetNetname() ) },
+                                      { "net_code", pad->GetNetCode() },
+                                      { "position", { { "x", lengthOf( pad->GetPosition().x ) },
+                                                      { "y", lengthOf( pad->GetPosition().y ) } } } } );
+                }
+
+                entry["pads"] = pads;
+            }
+
+            footprints.push_back( entry );
+        }
+
+        doc["footprints"] = footprints;
+    }
+
+    if( queryJob->m_includeNets )
+    {
+        nlohmann::json nets = nlohmann::json::array();
+
+        for( const NETINFO_ITEM* net : brd->GetNetInfo() )
+        {
+            if( !net )
+                continue;
+
+            nets.push_back( { { "code", net->GetNetCode() },
+                              { "name", TO_UTF8( net->GetNetname() ) } } );
+        }
+
+        doc["nets"] = nets;
+    }
+
+    if( queryJob->m_includeTracks || queryJob->m_includeVias )
+    {
+        nlohmann::json tracks = nlohmann::json::array();
+        nlohmann::json vias = nlohmann::json::array();
+
+        for( PCB_TRACK* track : brd->Tracks() )
+        {
+            if( track->Type() == PCB_VIA_T )
+            {
+                if( !queryJob->m_includeVias )
+                    continue;
+
+                const PCB_VIA* via = static_cast<const PCB_VIA*>( track );
+
+                vias.push_back( { { "net", TO_UTF8( via->GetNetname() ) },
+                                  { "net_code", via->GetNetCode() },
+                                  { "position", { { "x", lengthOf( via->GetPosition().x ) },
+                                                  { "y", lengthOf( via->GetPosition().y ) } } },
+                                  { "diameter", lengthOf( via->GetWidth() ) },
+                                  { "drill", lengthOf( via->GetDrillValue() ) } } );
+            }
+            else
+            {
+                if( !queryJob->m_includeTracks )
+                    continue;
+
+                tracks.push_back( { { "net", TO_UTF8( track->GetNetname() ) },
+                                    { "net_code", track->GetNetCode() },
+                                    { "layer", TO_UTF8( brd->GetLayerName( track->GetLayer() ) ) },
+                                    { "width", lengthOf( track->GetWidth() ) },
+                                    { "start", { { "x", lengthOf( track->GetStart().x ) },
+                                                 { "y", lengthOf( track->GetStart().y ) } } },
+                                    { "end", { { "x", lengthOf( track->GetEnd().x ) },
+                                               { "y", lengthOf( track->GetEnd().y ) } } } } );
+            }
+        }
+
+        if( queryJob->m_includeTracks )
+            doc["tracks"] = tracks;
+
+        if( queryJob->m_includeVias )
+            doc["vias"] = vias;
+    }
+
+    if( queryJob->m_includeZones )
+    {
+        nlohmann::json zones = nlohmann::json::array();
+
+        for( ZONE* zone : brd->Zones() )
+        {
+            nlohmann::json layerNames = nlohmann::json::array();
+
+            for( PCB_LAYER_ID layer : zone->GetLayerSet().Seq() )
+                layerNames.push_back( TO_UTF8( brd->GetLayerName( layer ) ) );
+
+            zones.push_back( { { "name", TO_UTF8( zone->GetZoneName() ) },
+                               { "net", TO_UTF8( zone->GetNetname() ) },
+                               { "net_code", zone->GetNetCode() },
+                               { "layers", layerNames },
+                               { "filled", zone->IsFilled() },
+                               { "priority", static_cast<int>( zone->GetAssignedPriority() ) } } );
+        }
+
+        doc["zones"] = zones;
+    }
+
+    if( queryJob->GetConfiguredOutputPath().IsEmpty() && queryJob->GetWorkingOutputPath().IsEmpty() )
+        queryJob->SetDefaultOutputPath( boardFile.GetFullPath() );
+
+    wxString outPath = resolveJobOutputPath( aJob, brd );
+
+    if( !PATHS::EnsurePathExists( outPath, true ) )
+    {
+        m_reporter->Report( _( "Failed to create output directory\n" ), RPT_SEVERITY_ERROR );
+        return CLI::EXIT_CODES::ERR_INVALID_OUTPUT_CONFLICT;
+    }
+
+    FILE* outFile = wxFopen( outPath, wxS( "wt" ) );
+
+    if( !outFile )
+    {
+        m_reporter->Report( wxString::Format( _( "Failed to create file '%s'.\n" ), outPath ),
+                            RPT_SEVERITY_ERROR );
+        return CLI::EXIT_CODES::ERR_INVALID_OUTPUT_CONFLICT;
+    }
+
+    if( fprintf( outFile, "%s", doc.dump( 2 ).c_str() ) < 0 )
+    {
+        fclose( outFile );
+        m_reporter->Report( wxString::Format( _( "Error writing file '%s'.\n" ), outPath ),
+                            RPT_SEVERITY_ERROR );
+        return CLI::EXIT_CODES::ERR_INVALID_OUTPUT_CONFLICT;
+    }
+
+    fclose( outFile );
+
+    m_reporter->Report( wxString::Format( _( "Wrote board query to '%s'.\n" ), outPath ),
+                        RPT_SEVERITY_ACTION );
+
+    queryJob->AddOutput( outPath );
 
     return CLI::EXIT_CODES::OK;
 }
